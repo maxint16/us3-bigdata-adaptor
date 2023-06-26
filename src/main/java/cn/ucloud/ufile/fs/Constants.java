@@ -166,10 +166,12 @@ public final class Constants {
     /** 过期缓冲时间，单位毫秒，10分钟 */
     public static long UFILE_STORAGE_ARCHIVE_BUFFEER_TIME = 10 * 60;
 
+    /** 文件拷贝需要分片的临界值，单位为 Byte, 100MB */
+    public static final int DEFAULT_MULTIPART_COPY_THRESHOLD = 100 * 1024 * 1024;
+
     /**
      * 涉及缓存相关的信息
      */
-    public static UFileMetaStore ufileMetaStore = new UFileMetaStore();
 
     /** 空buf */
     public static byte[] empytBuf = new byte[0];
@@ -250,6 +252,8 @@ public final class Constants {
     public static final String CS_UFILE_TIMEOUT = "fs.ufile.timeout";
 
     public static final String CS_US3_TIMEOUT = "fs.us3.timeout";
+
+    public static final String CANNOT_DELETE_ROOT = "Cannot delete root path";
 }
 
 

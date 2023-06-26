@@ -231,7 +231,7 @@ public class UFileFileStatus extends FileStatus {
      * @return
      */
     public boolean isArchive() {
-        return storageType.equals(Constants.UFILE_STORAGE_ARCHIVE);
+        return Constants.UFILE_STORAGE_ARCHIVE.equals(storageType);
     }
 
     public static enum RestoreStatus {
