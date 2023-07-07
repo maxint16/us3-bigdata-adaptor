@@ -4,8 +4,11 @@ import cn.ucloud.ufile.UfileClient;
 import cn.ucloud.ufile.api.object.DeleteObjectApi;
 import cn.ucloud.ufile.api.object.ObjectConfig;
 import cn.ucloud.ufile.api.object.ObjectListWithDirFormatApi;
+import cn.ucloud.ufile.api.object.multi.MultiUploadInfo;
+import cn.ucloud.ufile.api.object.multi.MultiUploadPartState;
 import cn.ucloud.ufile.auth.UfileObjectLocalAuthorization;
 import cn.ucloud.ufile.bean.CommonPrefix;
+import cn.ucloud.ufile.bean.MultiUploadResponse;
 import cn.ucloud.ufile.bean.ObjectContentBean;
 import cn.ucloud.ufile.bean.ObjectListWithDirFormatBean;
 import cn.ucloud.ufile.bean.ObjectProfile;
@@ -32,12 +35,11 @@ import java.io.IOException;
 import java.net.URI;
 import java.text.ParseException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
+import static cn.ucloud.ufile.UfileConstants.MULTIPART_SIZE;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_KEY;
 
 
@@ -318,6 +320,14 @@ public class UFileFileSystem extends org.apache.hadoop.fs.FileSystem {
             throw new FileNotFoundException(String.format("%s -> %s, source is not exists", srcOsMeta.getKey(),
                     dstOsMeta.getKey()));
         }
+        /**
+         * 暂不支持MDS
+        if (cfg.isUseMDS()) {
+            innerCopyFile(srcOsMeta, dstOsMeta, null, null);
+            delete(src, false);
+            return true;
+        }
+         */
 
         Path srcParent =  src.getParent();
         OSMeta srcParentMeta = UFileUtils.ParserPath(uri, workDir, srcParent);
@@ -381,8 +391,6 @@ public class UFileFileSystem extends org.apache.hadoop.fs.FileSystem {
             } else {
                 // 源地址为目录
                 if (dstFs.isFile()) {
-                    //throw new FileAlreadyExistsException(String.format("%s -> %s, dst is existing file", srcOsMeta.getKey(),
-                    //        dstOsMeta.getKey()));
                     return false;
                 }
             }
@@ -396,16 +404,14 @@ public class UFileFileSystem extends org.apache.hadoop.fs.FileSystem {
                 if (!newDstKey.isEmpty() && !newDstKey.endsWith("/")) {
                     newDstKey += "/";
                 }
-                newDstKey += src.getName();
+                newDstKey += srcOsMeta.getKey().substring(srcParentMeta.getKey().length());
                 UFileUtils.Debug(cfg.getLogLevel(), "[innerRename] src:%s is file, dst:%s is dir, newDst:%s ",
                         srcOsMeta.getKey(), dstOsMeta.getKey(), newDstKey);
                 dstOsMeta.setKey(newDstKey);
-                OSMeta newDstMeta = new OSMeta(dstOsMeta.getBucket(), newDstKey);
-                innerCopyFile(srcOsMeta, newDstMeta, "REPLACE", Collections.EMPTY_MAP);
+                copyFile(srcOsMeta.getKey(), newDstKey);
             } else if (dstFs == null) {
                 /** 文件到文件 */
-                FsPermission perm = UFileFileStatus.parsePermission(UFileFileSystem.getDefaultUserMeta());
-                innerCopyFile(srcOsMeta, dstOsMeta, "REPLACE", Collections.EMPTY_MAP);
+                copyFile(srcOsMeta.getKey(), dstOsMeta.getKey());
             } else {
                 return false;
             }
@@ -442,7 +448,7 @@ public class UFileFileSystem extends org.apache.hadoop.fs.FileSystem {
                 for (ObjectContentBean objectContent : objectList.getObjectContents()) {
                     OSMeta copySrcMeta = new OSMeta(objectContent.getBucketName(), objectContent.getKey());
                     OSMeta copyDstMeta = new OSMeta(bucket, copySrcMeta.getKey().replace(srcKey, dstKey));
-                    innerCopyFile(copySrcMeta, copyDstMeta, null, Collections.emptyMap());
+                    copyFile(copySrcMeta.getKey(), copyDstMeta.getKey());
                     deleteObject(copySrcMeta.getKey());
                 }
 
@@ -451,157 +457,6 @@ public class UFileFileSystem extends org.apache.hadoop.fs.FileSystem {
             }
         }
         return true;
-    }
-
-    /**
-     * invoke UFile rename API, but hadoop plugin just invoke under same bucket.
-     * @param srcKey
-     * @param dstKey
-     * @return
-     * @throws IOException
-     */
-    private boolean ufileRename(String srcKey, String dstKey) throws IOException {
-        UFileUtils.Debug(cfg.getLogLevel(),"[ufileRename] srcKey:%s exist, dstKey:%s ", srcKey, dstKey);
-        int retryCount = 1;
-        while(true){
-        try {
-            UfileClient.object(objauth, objcfg)
-                    .renameObject(bucket, srcKey).isForcedToCover(true)
-                    .isRenamedTo(dstKey)
-                    .execute();
-            return true;
-        } catch (UfileClientException e) {
-            UFileUtils.Error(cfg.getLogLevel(),"[ufileRename] client, srcKey:%s exist, dstKey:%s, %s ", srcKey, dstKey, e.toString());
-            if(retryCount>=Constants.DEFAULT_MAX_TRYTIMES)
-            throw UFileUtils.TranslateException(String.format("ufileRename to %s", dstKey), srcKey, e);
-        } catch (UfileServerException e) {
-            UFileUtils.Error(cfg.getLogLevel(),"[ufileRename] server, srcKey:%s exist, dstKey:%s, %s ", srcKey, dstKey, e.toString());
-            if(retryCount>=Constants.DEFAULT_MAX_TRYTIMES||e.getErrorBean().getResponseCode()<500)
-            throw UFileUtils.TranslateException(String.format("ufileRename to %s", dstKey), srcKey, e);
-        }finally{
-            retryCount ++;
-            try {
-                Thread.sleep(retryCount* Constants.TRY_DELAY_BASE_TIME);
-            } catch (InterruptedException e) {
-                throw new IOException("not able to handle exception", e);
-            }
-        }
-    }
-    }
-
-    /**
-     * list ufile objects without use delimeter "/" for rename && delete
-     * @param prefix
-     * @param nextMark
-     * @return
-     * @throws IOException
-     */
-    private ListUFileResult listUFileStatus(String prefix, String nextMark) throws IOException {
-        ListUFileResult lurs = new ListUFileResult();
-        List<UFileFileStatus> result = new LinkedList<>();
-        Path f = new Path(prefix);
-        int idx = 0;
-        HashMap hm = new HashMap<>();
-        int retryCount = 1;
-        while(true){
-        try {
-             ObjectListWithDirFormatBean response =UfileClient.object(objauth, objcfg)
-                     .objectListWithDirFormat(bucket)
-                     .withPrefix(prefix)
-                     .withMarker(nextMark)
-                     .dataLimit(Constants.LIST_OBJECTS_DEFAULT_LIMIT).execute();
-
-             List<CommonPrefix> dirs = response.getCommonPrefixes();
-             if (dirs != null) {
-                 for (int i = 0; i < dirs.size(); i++) {
-                     CommonPrefix cp = dirs.get(i);
-                     hm.put(cp.getPrefix(), idx);
-                     idx++;
-                     result.add(new UFileFileStatus(0,
-                         true,
-                         1,
-                         0,
-                         0,
-                         new Path(rootPath, dirs.get(i).getPrefix())));
-                 }
-             }
-
-             List<ObjectContentBean> objs = response.getObjectContents();
-             if (objs != null) {
-                 for (int i = 0; i < objs.size(); i++) {
-                     ObjectContentBean obj = objs.get(i);
-                     String key = obj.getKey();
-
-                     if (obj.getMimeType().equals(Constants.DIRECTORY_MIME_TYPE_1)) {
-                         key += "/";
-                     } else if (!obj.getMimeType().equals(Constants.DIRECTORY_MIME_TYPE_2)) {
-                         result.add(new UFileFileStatus(
-                                 Long.parseLong(obj.getSize()),
-                                 false,
-                                 1,
-                                 Constants.DEFAULT_HDFS_BLOCK_SIZE,
-                                 /** 反正该接口不会关注时间 */
-                                 0,
-                                 0,
-                                 //obj.getLastModified()*1000,
-                                 //obj.getLastModified()*1000,
-                                 null,
-                                 null,
-                                 null,
-                                 new Path(rootPath, key)));
-                         continue;
-                     }
-
-                     /** 证明这是一个目录 */
-                     if (hm.containsKey(key)) {
-                         int index = (int)(hm.get(prefix));
-                         result.set(index, new UFileFileStatus(this,
-                                 0,
-                                 true,
-                                 /** 反正该接口不会关注时间 */
-                                 0,
-                                 0,
-                                 //obj.getLastModified()*1000,
-                                 //obj.getLastModified()*1000,
-                                 new Path(rootPath, key),
-                                 null));
-                     } else {
-                         result.add(new UFileFileStatus(0,
-                                 true,
-                                 1,
-                                 0,
-                                 0,
-                                 new Path(rootPath, key)));
-                     }
-                }
-            }
-
-            lurs.nextMarker = response.getNextMarker();
-            UFileUtils.Debug(cfg.getLogLevel(),"[listUFileStatus] prefix:%s nextMark:%s rspNextMark:%s limit:%d",
-                    prefix,
-                    nextMark,
-                    lurs.nextMarker,
-                    Constants.LIST_OBJECTS_DEFAULT_LIMIT);
-
-            if (result.size() != 0) lurs.fss =  result;
-            return lurs;
-        } catch (UfileClientException e) {
-            e.printStackTrace();
-            if(retryCount>=Constants.DEFAULT_MAX_TRYTIMES)
-            throw UFileUtils.TranslateException("[listUFileStatus] exception too much times, ", f.toString(), e);
-        } catch (UfileServerException e) {
-            e.printStackTrace();
-            if(retryCount>=Constants.DEFAULT_MAX_TRYTIMES||e.getErrorBean().getResponseCode()<500)
-            throw UFileUtils.TranslateException("[listUFileStatus] exception too much times, ", f.toString(), e);
-        }finally{
-            retryCount ++;
-            try {
-                Thread.sleep(retryCount* Constants.TRY_DELAY_BASE_TIME);
-            } catch (InterruptedException e) {
-                throw new IOException("not able to handle exception", e);
-            }
-        }
-    }
     }
 
     @Override
@@ -1369,11 +1224,72 @@ public class UFileFileSystem extends org.apache.hadoop.fs.FileSystem {
         }
     }
 
+    private void copyFile(String srcKey, String dstKey) throws UfileServerException, UfileClientException {
+        UFileUtils.Debug(cfg.getLogLevel(),"[copyFile] srcKey:%s' dstKey:%s ", srcKey, dstKey);
+        ObjectProfile srcObjProfile = getObjectProfile(srcKey);
+        if (Constants.DEFAULT_MULTIPART_COPY_THRESHOLD > srcObjProfile.getContentLength()) {
+            UfileClient.object(objauth, objcfg)
+                    .copyObject(bucket, srcKey)
+                    .copyTo(bucket, dstKey)
+                    .execute();
+        } else {
+            UFileUtils.Debug(cfg.getLogLevel(),"[copyFile] file size: %d", srcObjProfile.getContentLength());
+            // 使用分片接口进行拷贝
+            MultiUploadInfo uploadInfo = UfileClient.object(objauth, objcfg)
+                    // 这里的 uploadTarget是 dstObject
+                    .initMultiUpload(dstKey, srcObjProfile.getContentType(), srcObjProfile.getBucket())
+                    .withStorageType(srcObjProfile.getStorageType())
+                    .withMetaDatas(srcObjProfile.getMetadatas())
+                    .execute();
+            // 需要先转成double 否则会丢失精度
+            int chunkCount = (int) Math.ceil((double) srcObjProfile.getContentLength() / MULTIPART_SIZE);
+            // 优化：使用线程池进行同步上传
+            List<MultiUploadPartState> partStateList = new ArrayList<>();
+            try {
+                for (int i = 0; i < chunkCount; i++) {
+                    int start = i * MULTIPART_SIZE;
+                    int end = start + MULTIPART_SIZE - 1;
+                    if (end >= srcObjProfile.getContentLength()) {
+                        end = (int) srcObjProfile.getContentLength();
+                    }
+                    MultiUploadPartState partState = UfileClient.object(objauth, objcfg)
+                            .multiUploadCopyPart(uploadInfo, i, srcObjProfile.getBucket(), srcObjProfile.getKeyName(),
+                                    start, end)
+                            .execute();
+                    partStateList.add(partState);
+                    UFileUtils.Debug(cfg.getLogLevel(),"[copyFile] part state: %s, start: %d, end: %d", partState.toString(), start, end);
+                }
+                while(true) {
+                    MultiUploadResponse res = UfileClient.object(objauth, objcfg)
+                            .finishMultiUpload(uploadInfo, partStateList)
+                            .execute();
+                    if (res.getFileSize() >= srcObjProfile.getContentLength()) {
+                        // 文件上传完毕
+                        break;
+                    }
+                    try {
+                        Thread.sleep(Constants.LIST_TRY_DELAY_BASE_TIME);
+                    } catch (InterruptedException e) {
+                        UFileUtils.Debug(cfg.getLogLevel(),"[copyFile] interrupted when waiting MultiCopy finish: %s", e.getMessage(), e);
+                        break;
+                    }
+                }
+            } catch (UfileServerException | UfileClientException e) {
+                // copy过程失败后要进行abort
+                UfileClient.object(objauth, objcfg)
+                        .abortMultiUpload(uploadInfo)
+                        .execute();
+                throw e;
+            }
+        }
+    }
+
     protected ObjectProfile getObjectProfile(String key) throws UfileServerException, UfileClientException {
         return UfileClient.object(objauth, objcfg)
                 .objectProfile(key, bucket)
                 .execute();
     }
+
     /**
      * Qualify a path.
      * @param path path to qualify
